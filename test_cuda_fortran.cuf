@@ -1,0 +1,340 @@
+!
+!  Test program to use PGI CUDA Fortran
+!
+
+MODULE PREC
+  ! Precision control
+
+  INTEGER, PARAMETER, PUBLIC :: ISP = KIND(0.0) ! Single precision
+  INTEGER, PARAMETER, PUBLIC :: IDP = KIND(0.0d0) ! Double precision
+
+  !INTEGER, PARAMETER, PUBLIC :: fp_kind = DOUBLE
+  !integer, parameter, public :: fp_kind = Single
+
+END MODULE PREC
+
+!
+! Define the INTERFACE to the NVIDIA CUFFT routines
+!
+
+MODULE cufft
+!
+!  module to define constants and interfaces to the cuFFT library
+!
+  INTEGER, PUBLIC :: CUFFT_FORWARD = -1
+  INTEGER, PUBLIC :: CUFFT_INVERSE = 1
+  ! define some constants for cuFFT, must use hex numbers
+  INTEGER, PUBLIC :: CUFFT_R2C = Z'2a' ! Real to Complex (interleaved)
+  INTEGER, PUBLIC :: CUFFT_C2R = Z'2c' ! Complex (interleaved) to Real
+  INTEGER, PUBLIC :: CUFFT_C2C = Z'29' ! Complex to Complex, interleaved
+  INTEGER, PUBLIC :: CUFFT_D2Z = Z'6a' ! Double to Double-Complex
+  INTEGER, PUBLIC :: CUFFT_Z2D = Z'6c' ! Double-Complex to Double
+  INTEGER, PUBLIC :: CUFFT_Z2Z = Z'69' ! Double-Complex to Double-Complex
+
+  ! cufftPlan2d(cufftHandle *plan, int nx,int ny, cufftType type)
+  INTERFACE cufftPlan2d
+     SUBROUTINE cufftPlan2d(plan, nx, ny, TYPE) BIND(C,name='cufftPlan2d')
+       USE iso_c_binding
+       INTEGER(c_int):: plan
+       INTEGER(c_int),VALUE:: nx, ny, TYPE
+     END SUBROUTINE cufftPlan2d
+  END INTERFACE cufftPlan2d
+
+
+  ! cufftDestroy(cufftHandle *plan)
+  INTERFACE cufftDestroy
+     SUBROUTINE cufftDestroy(plan) BIND(C,name='cufftDestroy')
+       USE iso_c_binding
+       INTEGER(c_int),VALUE:: plan
+     END SUBROUTINE cufftDestroy
+  END INTERFACE cufftDestroy
+
+  !  cufftExecD2Z(cufftHandle *plan, cufftDouble *idata, cufftDoubleComplex *odata)
+  INTERFACE cufftExecD2Z
+     SUBROUTINE cufftExecD2Z(plan, idata, odata) &
+          & BIND(C,name='cufftExecD2Z')
+       USE iso_c_binding
+       USE PREC
+       INTEGER(c_int), VALUE :: plan
+       REAL(IDP), device :: idata(1:nxreal,1:nyreal)
+       COMPLEX(IDP), device :: odata(1:nxreal,1:nyreal)
+     END SUBROUTINE cufftExecD2Z
+  END INTERFACE cufftExecD2Z
+
+  !  cufftExecZ2D(cufftHandle *plan, cufftDoubleComplex *idata, cufftDouble *odata)
+  INTERFACE cufftExecZ2D
+     SUBROUTINE cufftExecZ2D(plan, idata, odata) &
+          & BIND(C,name='cufftExecZ2D')
+       USE iso_c_binding
+       USE PREC
+       INTEGER(c_int),VALUE:: plan
+       COMPLEX(IDP),device:: idata(1:nxreal,1:nyreal)
+       REAL(IDP),device :: odata(1:nxreal,1:nyreal)
+     END SUBROUTINE cufftExecZ2D
+  END INTERFACE cufftExecZ2D
+
+END MODULE cufft
+
+MODULE PARAMS
+
+  USE PREC
+  IMPLICIT NONE
+
+  INTEGER, PARAMETER, PUBLIC :: kxmax = 40, kymax = kxmax
+  INTEGER, PARAMETER, PUBLIC :: nxreal = 256, nyreal = nxreal, ntot = nxreal*nyreal
+  INTEGER, PARAMETER, PUBLIC :: nxcmplx = nxreal/2+1, nycmplx = nyreal
+  INTEGER :: planf, planb
+
+  REAL(IDP), PARAMETER, PUBLIC :: pi = 4.d0*ATAN(1.d0)
+
+  COMPLEX(IDP), PARAMETER, PUBLIC :: czero = CMPLX(0.d0,0.d0)
+
+END MODULE PARAMS
+
+PROGRAM fft_test
+
+  USE PARAMS
+  USE PREC
+  USE cufft
+  IMPLICIT NONE
+
+  INTEGER :: i,j
+
+  ! Host variables
+  INTEGER, DIMENSION(0:nxcmplx-1,0:nycmplx-1) :: kx, ky
+  REAL(IDP), DIMENSION(nxreal,nyreal) :: ra, rb
+  COMPLEX(IDP), DIMENSION(0:nxcmplx-1,0:nycmplx-1) :: ca, cb
+
+  ! Device variables
+  INTEGER, DEVICE, DIMENSION(0:nxcmplx-1,0:nycmplx-1) :: kx_d, ky_d
+  REAL(IDP), DEVICE, DIMENSION(nxreal,nyreal) :: ra_d, rb_d
+  COMPLEX(IDP), DEVICE, DIMENSION(0:nxcmplx-1,0:nycmplx-1) :: ca_d, cb_d
+
+  ! set Fourier modes on device -- this is for indexing
+  kx_d = 0; ky_d = 0
+  !$cuf kernel do <<< *,* >>>
+  DO j = 0, nycmplx/2
+     DO i = 0, nxcmplx-1
+        kx_d(i,j) = i
+        ky_d(i,j) = j
+     END DO
+  END DO
+
+  !$cuf kernel do <<< *,* >>>
+  DO j = nycmplx/2+1, nycmplx-1
+     DO i = 0, nxcmplx-1
+        kx_d(i,j) = i
+        ky_d(i,j) = j - nycmplx
+     END DO
+  END DO
+
+  ! transfer data from device to host
+  kx = kx_d
+  ky = ky_d
+
+  OPEN(unit=34, file="kindex.out", status="replace")
+  WRITE(34,*) "kx = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (kx(i,j),i=0,nxcmplx-1)
+  END DO
+
+  WRITE(34,*) "ky = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (ky(i,j),i=0,nxcmplx-1)
+  END DO
+  CLOSE(34)
+
+
+  !initialize arrays on device
+  ca_d = czero
+
+  !$cuf kernel do <<< *,* >>>
+  DO j = 0, kymax
+     DO i = 0, kxmax
+        IF ((i .EQ. 0) .AND. (j .EQ. 0)) THEN
+           ca_d(i,j) = czero
+        ELSE
+           ca_d(i,j) = &
+                pi/REAL(kx_d(i,j)*kx_d(i,j) + ky_d(i,j)*ky_d(i,j))
+        END IF
+     END DO
+  END DO
+
+  !$cuf kernel do <<< *,* >>>
+  DO j = nycmplx-kymax, nycmplx-1
+     DO i = 0, kxmax
+        IF (i .EQ. 0) THEN
+           ca_d(i,j) = CONJG(ca_d(i,-1*(j-nycmplx)))
+        ELSE
+           ca_d(i,j) = &
+                pi/REAL(kx_d(i,j)*kx_d(i,j) + ky_d(i,j)*ky_d(i,j))
+        END IF
+     END DO
+  END DO
+
+  ! Create cuFFT plans
+  CALL cufftPlan2D(planf,nxreal,nyreal,CUFFT_D2Z)
+  CALL cufftPlan2D(planb,nxreal,nyreal,CUFFT_Z2D)
+
+  CALL cufftExecZ2D(planb, ca_d, ra_d)
+  CALL cufftExecD2Z(planf, ra_d, cb_d)
+
+  !$cuf kernel do <<< *,* >>>
+  DO j = 0, nycmplx-1
+     DO i = 0, nxcmplx-1
+        cb_d(i,j) = cb_d(i,j)/REAL(ntot)
+     END DO
+  END DO
+  ca = ca_d; cb = cb_d
+
+  ! write output
+  OPEN(unit=34, file="fft.out", status="replace")
+  WRITE(34,*) "diff = ", SUM(ABS(ca-cb))
+  WRITE(34,'(/a/)') ""
+  WRITE(34,*) "ca = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (ca(i,j),i=0,nxcmplx-1)
+  END DO
+  WRITE(34,'(/a/)') ""
+  WRITE(34,*) "cb = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (cb(i,j),i=0,nxcmplx-1)
+  END DO
+  CLOSE(34)
+
+
+  ! generate another set of data
+  cb_d = ca_d
+  cb = cb_d
+
+  WRITE(*,*) "ca - cb = ", SUM(ABS(ca-cb))
+
+  CALL CONVOLVE_FFT(ca_d,cb_d,ky_d,ca_d)
+  CALL CONVOLVE(ca,cb,cb)
+
+  ca = ca_d
+
+  ! write output
+  OPEN(unit=34, file="convolve.out", status="replace")
+  WRITE(34,*) "diff = ", SUM(ABS(ca-cb))
+  WRITE(34,'(/a/)') ""
+  WRITE(34,*) "ca = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (ca(i,j),i=0,nxcmplx-1)
+  END DO
+  WRITE(34,'(/a/)') ""
+  WRITE(34,*) "cb = "
+  DO j = 0, nycmplx-1
+     WRITE(34,*) (cb(i,j),i=0,nxcmplx-1)
+  END DO
+  CLOSE(34)
+
+  ! Destroy the plan
+  CALL cufftDestroy(planf)
+
+END PROGRAM fft_test
+
+SUBROUTINE CONVOLVE_FFT(var1in,var2in,kyin,varout)
+!
+!  Perform convolutions using FFT
+!
+  USE PREC
+  USE PARAMS
+  USE CUFFT
+  IMPLICIT NONE
+
+  INTEGER :: i,j
+
+  INTEGER, DEVICE, DIMENSION(0:nxcmplx-1,0:nycmplx-1), INTENT(IN) :: kyin
+  COMPLEX(IDP), DEVICE, DIMENSION(0:nxcmplx-1,0:nycmplx-1), INTENT(IN) :: var1in,var2in
+  COMPLEX(IDP), DEVICE, DIMENSION(0:nxcmplx-1,0:nycmplx-1), INTENT(OUT) :: varout
+  REAL(IDP), DEVICE, DIMENSION(nxreal,nyreal) :: rvar1,rvar2,rvar3
+
+  CALL cufftExecZ2D(planb, var1in, rvar1)
+  CALL cufftExecZ2D(planb, var2in, rvar2)
+
+  !$cuf kernel do <<< *,* >>>
+  DO j = 1, nyreal
+     DO i = 1, nxreal
+        rvar3(i,j) = rvar1(i,j)*rvar2(i,j)
+     END DO
+  END DO
+
+  CALL cufftExecD2Z(planf, rvar3, varout)
+
+  ! Normalize and zero out higher modes
+  !$cuf kernel do <<< *,* >>>
+  DO j = 0, nycmplx-1
+     DO i = 0, nxcmplx-1
+        IF ((i .LE. kxmax) .AND. (ABS(kyin(i,j)) .LE. kymax) ) THEN
+           varout(i,j) = varout(i,j)/REAL(ntot)
+        ELSE
+           varout(i,j) = czero
+        END IF
+     END DO
+  END DO
+
+END SUBROUTINE CONVOLVE_FFT
+
+SUBROUTINE CONVOLVE(kvar1,kvar2,kvar3)
+!
+!  Subroutine to do convolution in k-space by summing all modes
+!  -- Outer loop designate per mode
+!  -- Inner loop is to sum the modes depending on the limits
+!  -- Code was adapted from a previos FFT test case, so the variables were relabeled.
+!
+      USE PREC
+      USE PARAMS, ONLY: kxmax,kymax,czero,nxcmplx,nycmplx
+      IMPLICIT NONE
+
+      INTEGER :: i,j, ix, iy, kxd, kyd
+      INTEGER :: kxlmin, kxlmax, kylmin, kylmax
+      COMPLEX(IDP) :: var1temp, var2temp
+      COMPLEX(IDP), DIMENSION(0:kxmax,-kymax:kymax) :: var1in,var2in,varout
+      COMPLEX(IDP), DIMENSION(0:nxcmplx-1,0:nycmplx-1), INTENT(IN) :: kvar1, kvar2
+      COMPLEX(IDP), DIMENSION(0:nxcmplx-1,0:nycmplx-1), INTENT(OUT) :: kvar3
+
+      ! transform from extended array
+      var1in = czero; var2in = czero
+      var1in(0:kxmax,0:kymax) = kvar1(0:kxmax,0:kymax)
+      var1in(0:kxmax,-kymax:-1) = kvar1(0:kxmax,nycmplx-kymax:nycmplx-1)
+      var2in(0:kxmax,0:kymax) = kvar2(0:kxmax,0:kymax)
+      var2in(0:kxmax,-kymax:-1) = kvar2(0:kxmax,nycmplx-kymax:nycmplx-1)
+
+      varout = czero
+      DO i = 0, kxmax
+         DO j = -kymax, kymax
+
+            ! inner loop needs to account for all modes
+            DO ix = -kxmax, kxmax
+               DO iy = -kymax, kymax
+                  kxd = i - ix; kyd = j - iy
+
+                  ! conditions to catch limits and negative kx modes
+                  IF ((ABS(kxd) .GT. kxmax) .OR. (ABS(kyd) .GT. kymax)) THEN 
+                     var1temp = czero
+                  ELSE IF (kxd .LT. 0) THEN
+                     var1temp = CONJG(var1in(-kxd,-kyd))
+                  ELSE
+                     var1temp = var1in(kxd,kyd)
+                  END IF
+                  IF (ix .LT. 0) THEN 
+                     var2temp = CONJG(var2in(-ix,-iy))
+                  ELSE
+                     var2temp = var2in(ix,iy)
+                  END IF
+
+                  varout(i,j) = varout(i,j) + var1temp*var2temp
+                     
+                  END DO
+            END DO
+
+         END DO
+      END DO
+
+      ! transform to extended array
+      kvar3 = czero
+      kvar3(0:kxmax,0:kymax) = varout(0:kxmax,0:kymax)
+      kvar3(0:kxmax,nycmplx-kymax:nycmplx-1) = varout(0:kxmax,-kymax:-1)
+
+END SUBROUTINE CONVOLVE
